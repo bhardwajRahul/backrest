@@ -18,7 +18,8 @@ import (
 	"go.uber.org/zap"
 )
 
-// RepoOrchestrator is responsible for managing a single repo.
+// RepoOrchestrator implements higher level repository operations on top of
+// the restic package. It can be thought of as a controller for a repo.
 type RepoOrchestrator struct {
 	mu sync.Mutex
 
@@ -41,7 +42,6 @@ func NewRepoOrchestrator(config *v1.Config, repoConfig *v1.Repo, resticPath stri
 	}
 
 	opts = append(opts, restic.WithEnviron())
-	opts = append(opts, restic.WithEnv("RESTIC_PROGRESS_FPS=2"))
 
 	if env := repoConfig.GetEnv(); len(env) != 0 {
 		for _, e := range env {
@@ -52,9 +52,16 @@ func NewRepoOrchestrator(config *v1.Config, repoConfig *v1.Repo, resticPath stri
 	for _, f := range repoConfig.GetFlags() {
 		args, err := shlex.Split(f)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse flag %q for repo %q: %w", f, repoConfig.Id, err)
+			return nil, fmt.Errorf("parse flag %q for repo %q: %w", f, repoConfig.Id, err)
 		}
 		opts = append(opts, restic.WithFlags(args...))
+	}
+
+	// Resolve command prefix
+	if extraOpts, err := resolveCommandPrefix(repoConfig.GetCommandPrefix()); err != nil {
+		return nil, fmt.Errorf("resolve command prefix: %w", err)
+	} else {
+		opts = append(opts, extraOpts...)
 	}
 
 	// Add BatchMode=yes to sftp.args if it's not already set.
@@ -97,7 +104,12 @@ func (r *RepoOrchestrator) SnapshotsForPlan(ctx context.Context, plan *v1.Plan) 
 	ctx, flush := forwardResticLogs(ctx)
 	defer flush()
 
-	snapshots, err := r.repo.Snapshots(ctx, restic.WithFlags("--tag", TagForPlan(plan.Id)+","+TagForInstance(r.config.Instance)))
+	tags := []string{TagForPlan(plan.Id)}
+	if r.config.Instance != "" {
+		tags = append(tags, TagForInstance(r.config.Instance))
+	}
+
+	snapshots, err := r.repo.Snapshots(ctx, restic.WithFlags("--tag", strings.Join(tags, ",")))
 	if err != nil {
 		return nil, fmt.Errorf("get snapshots for plan %q: %w", plan.Id, err)
 	}
@@ -112,7 +124,7 @@ func (r *RepoOrchestrator) Backup(ctx context.Context, plan *v1.Plan, progressCa
 	defer r.mu.Unlock()
 
 	if !r.initialized {
-		if err := r.repo.Init(ctx, restic.WithEnviron()); err != nil {
+		if err := r.repo.Init(ctx); err != nil {
 			return nil, fmt.Errorf("failed to initialize repo: %w", err)
 		}
 		r.initialized = true
@@ -131,8 +143,13 @@ func (r *RepoOrchestrator) Backup(ctx context.Context, plan *v1.Plan, progressCa
 	opts = append(opts, restic.WithFlags(
 		"--exclude-caches",
 		"--tag", TagForPlan(plan.Id),
-		"--tag", TagForInstance(r.config.Instance)),
-	)
+	))
+
+	if r.config.Instance != "" {
+		opts = append(opts, restic.WithFlags("--tag", TagForInstance(r.config.Instance)))
+	} else {
+		zap.L().Warn("Creating a backup without an 'instance' tag as no value is set in the config. In a future backrest release this will be an error.")
+	}
 
 	for _, exclude := range plan.Excludes {
 		opts = append(opts, restic.WithFlags("--exclude", exclude))
@@ -192,10 +209,6 @@ func (r *RepoOrchestrator) Forget(ctx context.Context, plan *v1.Plan, tags []str
 		return nil, fmt.Errorf("plan %q has no retention policy", plan.Id)
 	}
 
-	if r.config.Instance == "" {
-		return nil, errors.New("instance is a required field in the backrest config")
-	}
-
 	result, err := r.repo.Forget(
 		ctx, protoutil.RetentionPolicyFromProto(plan.Retention),
 		restic.WithFlags("--tag", strings.Join(tags, ",")),
@@ -253,6 +266,32 @@ func (r *RepoOrchestrator) Prune(ctx context.Context, output io.Writer) error {
 	err := r.repo.Prune(ctx, output, opts...)
 	if err != nil {
 		return fmt.Errorf("prune snapshots for repo %v: %w", r.repoConfig.Id, err)
+	}
+	return nil
+}
+
+func (r *RepoOrchestrator) Check(ctx context.Context, output io.Writer) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ctx, flush := forwardResticLogs(ctx)
+	defer flush()
+
+	var opts []restic.GenericOption
+	if r.repoConfig.CheckPolicy != nil {
+		switch m := r.repoConfig.CheckPolicy.Mode.(type) {
+		case *v1.CheckPolicy_ReadDataSubsetPercent:
+			if m.ReadDataSubsetPercent > 0 {
+				opts = append(opts, restic.WithFlags(fmt.Sprintf("--read-data-subset=%v%%", m.ReadDataSubsetPercent)))
+			}
+		case *v1.CheckPolicy_StructureOnly:
+		default:
+		}
+	}
+
+	r.l.Debug("checking repo")
+	err := r.repo.Check(ctx, output, opts...)
+	if err != nil {
+		return fmt.Errorf("check repo %v: %w", r.repoConfig.Id, err)
 	}
 	return nil
 }
@@ -326,6 +365,8 @@ func (r *RepoOrchestrator) Stats(ctx context.Context) (*v1.RepoStats, error) {
 func (r *RepoOrchestrator) AddTags(ctx context.Context, snapshotIDs []string, tags []string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	ctx, flush := forwardResticLogs(ctx)
+	defer flush()
 
 	for idx, snapshotIDs := range chunkBy(snapshotIDs, 20) {
 		r.l.Debug("adding tag to snapshots", zap.Strings("snapshots", snapshotIDs), zap.Strings("tags", tags))
@@ -335,6 +376,24 @@ func (r *RepoOrchestrator) AddTags(ctx context.Context, snapshotIDs []string, ta
 	}
 
 	return nil
+}
+
+// RunCommand runs a command in the repo's environment. Output is buffered and sent to the onProgress callback in batches.
+func (r *RepoOrchestrator) RunCommand(ctx context.Context, command string, onProgress func([]byte)) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ctx, flush := forwardResticLogs(ctx)
+	defer flush()
+
+	r.l.Debug("running command", zap.String("command", command))
+	args, err := shlex.Split(command)
+	if err != nil {
+		return fmt.Errorf("parse command: %w", err)
+	}
+
+	ctx = restic.ContextWithLogger(ctx, &callbackWriter{callback: onProgress})
+
+	return r.repo.GenericCommand(ctx, args)
 }
 
 func (r *RepoOrchestrator) Config() *v1.Repo {
@@ -355,4 +414,13 @@ func chunkBy[T any](items []T, chunkSize int) (chunks [][]T) {
 		items, chunks = items[chunkSize:], append(chunks, items[0:chunkSize:chunkSize])
 	}
 	return append(chunks, items)
+}
+
+type callbackWriter struct {
+	callback func([]byte) // note: callback must not retain the byte slice
+}
+
+func (w *callbackWriter) Write(p []byte) (n int, err error) {
+	w.callback(p)
+	return len(p), nil
 }

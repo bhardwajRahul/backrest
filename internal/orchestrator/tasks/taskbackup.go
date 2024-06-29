@@ -12,7 +12,6 @@ import (
 	"github.com/garethgeorge/backrest/internal/hook"
 	"github.com/garethgeorge/backrest/internal/protoutil"
 	"github.com/garethgeorge/backrest/pkg/restic"
-	"github.com/gitploy-io/cronexpr"
 	"go.uber.org/zap"
 )
 
@@ -21,69 +20,74 @@ var maxBackupErrorHistoryLength = 20 // arbitrary limit on the number of file re
 // BackupTask is a scheduled backup operation.
 type BackupTask struct {
 	BaseTask
-	scheduler func(curTime time.Time) *time.Time
+	force  bool
+	didRun bool
 }
 
 var _ Task = &BackupTask{}
 
 func NewScheduledBackupTask(plan *v1.Plan) (*BackupTask, error) {
-	sched, err := cronexpr.ParseInLocation(plan.Cron, time.Now().Location().String())
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse schedule %q: %w", plan.Cron, err)
-	}
-
 	return &BackupTask{
 		BaseTask: BaseTask{
 			TaskName:   fmt.Sprintf("backup for plan %q", plan.Id),
 			TaskRepoID: plan.Repo,
 			TaskPlanID: plan.Id,
-		},
-		scheduler: func(curTime time.Time) *time.Time {
-			next := sched.Next(curTime)
-			return &next
 		},
 	}, nil
 }
 
 func NewOneoffBackupTask(plan *v1.Plan, at time.Time) *BackupTask {
-	didOnce := false
 	return &BackupTask{
 		BaseTask: BaseTask{
 			TaskName:   fmt.Sprintf("backup for plan %q", plan.Id),
 			TaskRepoID: plan.Repo,
 			TaskPlanID: plan.Id,
 		},
-		scheduler: func(curTime time.Time) *time.Time {
-			if didOnce {
-				return nil
-			}
-			didOnce = true
-			return &at
-		},
+		force: true,
 	}
 }
 
-func (t *BackupTask) Next(now time.Time, runner TaskRunner) ScheduledTask {
-	next := t.scheduler(now)
-	if next == nil {
-		return NeverScheduledTask
+func (t *BackupTask) Next(now time.Time, runner TaskRunner) (ScheduledTask, error) {
+	if t.force {
+		if t.didRun {
+			return NeverScheduledTask, nil
+		}
+		t.didRun = true
+		return ScheduledTask{
+			Task:  t,
+			RunAt: now,
+			Op: &v1.Operation{
+				Op: &v1.Operation_OperationBackup{},
+			},
+		}, nil
+	}
+
+	plan, err := runner.GetPlan(t.PlanID())
+	if err != nil {
+		return NeverScheduledTask, err
+	}
+
+	if plan.Schedule == nil {
+		return NeverScheduledTask, nil
+	}
+	nextRun, err := protoutil.ResolveSchedule(plan.Schedule, now)
+	if errors.Is(err, protoutil.ErrScheduleDisabled) {
+		return NeverScheduledTask, nil
+	} else if err != nil {
+		return NeverScheduledTask, fmt.Errorf("resolving schedule: %w", err)
 	}
 
 	return ScheduledTask{
 		Task:  t,
-		RunAt: *next,
+		RunAt: nextRun,
 		Op: &v1.Operation{
-			PlanId:          t.PlanID(),
-			RepoId:          t.RepoID(),
-			UnixTimeStartMs: (*next).UnixMilli(),
-			Status:          v1.OperationStatus_STATUS_PENDING,
-			Op:              &v1.Operation_OperationBackup{},
+			Op: &v1.Operation_OperationBackup{},
 		},
-	}
+	}, nil
 }
 
 func (t *BackupTask) Run(ctx context.Context, st ScheduledTask, runner TaskRunner) error {
-	l := Logger(ctx, st.Task)
+	l := runner.Logger(ctx)
 
 	startTime := time.Now()
 	op := st.Op
@@ -129,10 +133,10 @@ func (t *BackupTask) Run(ctx context.Context, st ScheduledTask, runner TaskRunne
 
 			backupOp.OperationBackup.LastStatus = protoutil.BackupProgressEntryToProto(entry)
 		} else if entry.MessageType == "error" {
-			zap.S().Warnf("an unknown error was encountered in processing item: %v", entry.Item)
+			l.Sugar().Warnf("an unknown error was encountered in processing item: %v", entry.Item)
 			backupError, err := protoutil.BackupProgressEntryToBackupError(entry)
 			if err != nil {
-				zap.S().Errorf("failed to convert backup progress entry to backup error: %v", err)
+				l.Sugar().Errorf("failed to convert backup progress entry to backup error: %v", err)
 				return
 			}
 			if len(backupOp.OperationBackup.Errors) > maxBackupErrorHistoryLength ||
@@ -154,7 +158,7 @@ func (t *BackupTask) Run(ctx context.Context, st ScheduledTask, runner TaskRunne
 		sendWg.Add(1)
 		go func() {
 			if err := runner.UpdateOperation(op); err != nil {
-				zap.S().Errorf("failed to update oplog with progress for backup: %v", err)
+				l.Sugar().Errorf("failed to update oplog with progress for backup: %v", err)
 			}
 			sendWg.Done()
 		}()
@@ -170,27 +174,32 @@ func (t *BackupTask) Run(ctx context.Context, st ScheduledTask, runner TaskRunne
 		SnapshotStats: summary,
 		SnapshotId:    summary.SnapshotId,
 	}
+
 	if err != nil {
 		vars.Error = err.Error()
 		if !errors.Is(err, restic.ErrPartialBackup) {
 			runner.ExecuteHooks([]v1.Hook_Condition{
 				v1.Hook_CONDITION_SNAPSHOT_ERROR,
 				v1.Hook_CONDITION_ANY_ERROR,
+				v1.Hook_CONDITION_SNAPSHOT_END,
 			}, vars)
 			return err
 		} else {
 			vars.Error = fmt.Sprintf("partial backup, %d files may not have been read completely.", len(backupOp.OperationBackup.Errors))
-			runner.ExecuteHooks([]v1.Hook_Condition{
-				v1.Hook_CONDITION_SNAPSHOT_WARNING,
-			}, vars)
 		}
 		op.Status = v1.OperationStatus_STATUS_WARNING
 		op.DisplayMessage = "Partial backup, some files may not have been read completely."
-	}
 
-	runner.ExecuteHooks([]v1.Hook_Condition{
-		v1.Hook_CONDITION_SNAPSHOT_END,
-	}, vars)
+		runner.ExecuteHooks([]v1.Hook_Condition{
+			v1.Hook_CONDITION_SNAPSHOT_WARNING,
+			v1.Hook_CONDITION_SNAPSHOT_END,
+		}, vars)
+	} else {
+		runner.ExecuteHooks([]v1.Hook_Condition{
+			v1.Hook_CONDITION_SNAPSHOT_SUCCESS,
+			v1.Hook_CONDITION_SNAPSHOT_END,
+		}, vars)
+	}
 
 	op.SnapshotId = summary.SnapshotId
 	backupOp.OperationBackup.LastStatus = protoutil.BackupProgressEntryToProto(summary)

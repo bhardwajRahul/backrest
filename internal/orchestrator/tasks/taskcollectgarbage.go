@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	gcStartupDelay = 5 * time.Second
+	gcStartupDelay = 60 * time.Second
 	gcInterval     = 24 * time.Hour
 	// keep operations that are eligible for gc for 30 days OR up to a limit of 100 for any one plan.
 	// an operation is eligible for gc if:
@@ -38,21 +38,21 @@ func NewCollectGarbageTask() *CollectGarbageTask {
 
 var _ Task = &CollectGarbageTask{}
 
-func (t *CollectGarbageTask) Next(now time.Time, runner TaskRunner) ScheduledTask {
+func (t *CollectGarbageTask) Next(now time.Time, runner TaskRunner) (ScheduledTask, error) {
 	if !t.firstRun {
 		t.firstRun = true
 		runAt := now.Add(gcStartupDelay)
 		return ScheduledTask{
 			Task:  t,
 			RunAt: runAt,
-		}
+		}, nil
 	}
 
 	runAt := now.Add(gcInterval)
 	return ScheduledTask{
 		Task:  t,
 		RunAt: runAt,
-	}
+	}, nil
 }
 
 func (t *CollectGarbageTask) Run(ctx context.Context, st ScheduledTask, runner TaskRunner) error {

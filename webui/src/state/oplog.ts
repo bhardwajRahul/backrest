@@ -4,14 +4,17 @@ import {
   OperationEventType,
   OperationStatus,
 } from "../../gen/ts/v1/operations_pb";
-import { GetOperationsRequest } from "../../gen/ts/v1/service_pb";
+import { GetOperationsRequest, OpSelector } from "../../gen/ts/v1/service_pb";
 import { BackupProgressEntry, ResticSnapshot } from "../../gen/ts/v1/restic_pb";
 import _ from "lodash";
 import { formatDuration, formatTime } from "../lib/formatting";
 import { backrestService } from "../api";
-import { STATS_OPERATION_HISTORY, STATUS_OPERATION_HISTORY } from "../constants";
+import {
+  STATS_OPERATION_HISTORY,
+  STATUS_OPERATION_HISTORY,
+} from "../constants";
 
-const subscribers: ((event: OperationEvent) => void)[] = [];
+const subscribers: ((event?: OperationEvent, err?: Error) => void)[] = [];
 
 // Start fetching and emitting operations.
 (async () => {
@@ -20,51 +23,46 @@ const subscribers: ((event: OperationEvent) => void)[] = [];
     try {
       for await (const event of backrestService.getOperationEvents({})) {
         console.log("operation event", event);
-        subscribers.forEach((subscriber) => subscriber(event));
+        subscribers.forEach((subscriber) => subscriber(event, undefined));
       }
     } catch (e: any) {
       console.error("operations stream died with exception: ", e);
     }
     await new Promise((accept, _) =>
-      setTimeout(accept, nextConnWaitUntil - new Date().getTime())
+      setTimeout(accept, nextConnWaitUntil - new Date().getTime()),
     );
+    subscribers.forEach((subscriber) => subscriber(undefined, new Error("reconnecting")));
   }
 })();
 
 export const getOperations = async (
-  req: GetOperationsRequest
+  req: GetOperationsRequest,
 ): Promise<Operation[]> => {
   const opList = await backrestService.getOperations(req);
   return opList.operations || [];
 };
 
 export const subscribeToOperations = (
-  callback: (event: OperationEvent) => void
+  callback: (event?: OperationEvent, err?: Error) => void,
 ) => {
   subscribers.push(callback);
+  console.log("subscribed to operations, subscriber count: ", subscribers.length);
 };
 
 export const unsubscribeFromOperations = (
-  callback: (event: OperationEvent) => void
+  callback: (event?: OperationEvent, err?: Error) => void,
 ) => {
   const index = subscribers.indexOf(callback);
   if (index > -1) {
     subscribers[index] = subscribers[subscribers.length - 1];
     subscribers.pop();
   }
+  console.log("unsubscribed from operations, subscriber count: ", subscribers.length);
 };
 
-export const getStatusForPlan = async (plan: string) => {
+export const getStatusForSelector = async (sel: OpSelector) => {
   const req = new GetOperationsRequest({
-    planId: plan,
-    lastN: BigInt(STATUS_OPERATION_HISTORY),
-  });
-  return await getStatus(req);
-};
-
-export const getStatusForRepo = async (repo: string) => {
-  const req = new GetOperationsRequest({
-    repoId: repo,
+    selector: sel,
     lastN: BigInt(STATUS_OPERATION_HISTORY),
   });
   return await getStatus(req);
@@ -104,6 +102,7 @@ export enum DisplayType {
   SNAPSHOT,
   FORGET,
   PRUNE,
+  CHECK,
   RESTORE,
   STATS,
   RUNHOOK,
@@ -130,7 +129,7 @@ export interface BackupInfo {
 export class BackupInfoCollector {
   private listeners: ((
     event: OperationEventType,
-    info: BackupInfo[]
+    info: BackupInfo[],
   ) => void)[] = [];
 
   // backups maps a flow ID to a backup info object.
@@ -138,10 +137,53 @@ export class BackupInfoCollector {
   private backupsByFlowId: Map<bigint, BackupInfo> = new Map();
 
   /**
-   * 
+   *
    * @param filter a function that returns true if an operation should be displayed, false otherwise.
    */
-  constructor(private filter: (op: Operation) => boolean = (op) => !shouldHideOperation(op)) { }
+  constructor(
+    private filter: (op: Operation) => boolean = (op) =>
+      !shouldHideOperation(op),
+  ) { }
+
+  public reset() {
+    this.operationsByFlowId = new Map();
+    this.backupsByFlowId = new Map();
+  }
+
+  public collectFromRequest(request: GetOperationsRequest, onError?: (cb: Error) => void): () => void {
+    getOperations(request).then((ops) => {
+      this.bulkAddOperations(ops);
+    }).catch(onError);
+
+    const cb = (event?: OperationEvent, err?: Error) => {
+      if (event) {
+        if (
+          !request.selector ||
+          !event.operation ||
+          !matchSelector(request.selector, event.operation)
+        ) {
+          return;
+        }
+        if (event.type !== OperationEventType.EVENT_DELETED) {
+          this.addOperation(event.type!, event.operation!);
+        } else {
+          this.removeOperation(event.operation!);
+        }
+      } else if (err) {
+        if (onError) onError(err);
+        console.error("error in operations stream: ", err);
+        getOperations(request).then((ops) => {
+          this.reset();
+          this.bulkAddOperations(ops);
+        }).catch(onError);
+      }
+    }
+    subscribeToOperations(cb);
+
+    return () => {
+      unsubscribeFromOperations(cb);
+    };
+  }
 
   private createBackup(operations: Operation[]): BackupInfo {
     // deduplicate and sort operations.
@@ -203,13 +245,13 @@ export class BackupInfoCollector {
       displayTime,
       displayType,
       status,
-      operations,
       backupLastStatus,
       snapshotInfo,
       forgotten,
       snapshotId: snapshotId,
       planId: operations[0].planId,
       repoId: operations[0].repoId,
+      operations: [...operations], // defensive copy.
     };
   }
 
@@ -241,7 +283,10 @@ export class BackupInfoCollector {
     return existing;
   }
 
-  public addOperation(event: OperationEventType, op: Operation): BackupInfo | null {
+  public addOperation(
+    event: OperationEventType,
+    op: Operation,
+  ): BackupInfo | null {
     if (!this.filter(op)) {
       this.removeOperation(op);
       return null;
@@ -269,7 +314,7 @@ export class BackupInfoCollector {
     this.backupsByFlowId.delete(op.flowId); // delete the cache for lazy recomputation.
 
     this.listeners.forEach((l) =>
-      l(OperationEventType.EVENT_DELETED, this.getAll())
+      l(OperationEventType.EVENT_DELETED, this.getAll()),
     );
   }
 
@@ -288,7 +333,7 @@ export class BackupInfoCollector {
   }
 
   public getAll(): BackupInfo[] {
-    const arr = []
+    const arr = [];
     for (const key of this.operationsByFlowId.keys()) {
       arr.push(this.getBackupInfo(key)!);
     }
@@ -296,13 +341,13 @@ export class BackupInfoCollector {
   }
 
   public subscribe(
-    listener: (event: OperationEventType, info: BackupInfo[]) => void
+    listener: (event: OperationEventType, info: BackupInfo[]) => void,
   ) {
     this.listeners.push(listener);
   }
 
   public unsubscribe(
-    listener: (event: OperationEventType, info: BackupInfo[]) => void
+    listener: (event: OperationEventType, info: BackupInfo[]) => void,
   ) {
     const index = this.listeners.indexOf(listener);
     if (index > -1) {
@@ -315,7 +360,8 @@ export class BackupInfoCollector {
 export const shouldHideOperation = (operation: Operation) => {
   return (
     operation.op.case === "operationStats" ||
-    (operation.op.case === "operationRunHook" && operation.status === OperationStatus.STATUS_SUCCESS) ||
+    (operation.op.case === "operationRunHook" &&
+      operation.status === OperationStatus.STATUS_SUCCESS) ||
     shouldHideStatus(operation.status)
   );
 };
@@ -333,6 +379,8 @@ export const getTypeForDisplay = (op: Operation) => {
       return DisplayType.FORGET;
     case "operationPrune":
       return DisplayType.PRUNE;
+    case "operationCheck":
+      return DisplayType.CHECK;
     case "operationRestore":
       return DisplayType.RESTORE;
     case "operationStats":
@@ -354,6 +402,8 @@ export const displayTypeToString = (type: DisplayType) => {
       return "Forget";
     case DisplayType.PRUNE:
       return "Prune";
+    case DisplayType.CHECK:
+      return "Check";
     case DisplayType.RESTORE:
       return "Restore";
     case DisplayType.STATS:
@@ -378,7 +428,7 @@ export const colorForStatus = (status: OperationStatus) => {
     case OperationStatus.STATUS_SUCCESS:
       return "green";
     case OperationStatus.STATUS_USER_CANCELLED:
-      return "orange";
+      return "yellow";
     default:
       return "grey";
   }
@@ -386,7 +436,7 @@ export const colorForStatus = (status: OperationStatus) => {
 
 // detailsForOperation returns derived display information for a given operation.
 export const detailsForOperation = (
-  op: Operation
+  op: Operation,
 ): {
   state: string;
   displayState: string;
@@ -404,7 +454,7 @@ export const detailsForOperation = (
       color = "grey";
       break;
     case OperationStatus.STATUS_INPROGRESS:
-      state = "runnning";
+      state = "running";
       duration = new Date().getTime() - Number(op.unixTimeStartMs);
       color = "blue";
       break;
@@ -422,7 +472,7 @@ export const detailsForOperation = (
       break;
     case OperationStatus.STATUS_USER_CANCELLED:
       state = "cancelled";
-      color = "orange";
+      color = "yellow";
       break;
     default:
       state = "";
@@ -479,3 +529,17 @@ export const detailsForOperation = (
     color,
   };
 };
+
+export const matchSelector = (selector: OpSelector, op: Operation) => {
+  if (selector.planId && selector.planId !== op.planId) {
+    return false;
+  }
+  if (selector.repoId && selector.repoId !== op.repoId) {
+    return false;
+  }
+  if (selector.flowId && selector.flowId !== op.flowId) {
+    return false;
+  }
+  return true;
+}
+

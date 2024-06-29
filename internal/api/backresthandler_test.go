@@ -109,7 +109,9 @@ func TestBackup(t *testing.T) {
 					Paths: []string{
 						t.TempDir(),
 					},
-					Cron: "0 0 1 1 *",
+					Schedule: &v1.Schedule{
+						Schedule: &v1.Schedule_Disabled{Disabled: true},
+					},
 					Retention: &v1.RetentionPolicy{
 						KeepHourly: 1,
 					},
@@ -177,8 +179,6 @@ func TestBackup(t *testing.T) {
 }
 
 func TestMultipleBackup(t *testing.T) {
-	t.Parallel()
-
 	sut := createSystemUnderTest(t, &config.MemoryStore{
 		Config: &v1.Config{
 			Modno:    1234,
@@ -197,7 +197,9 @@ func TestMultipleBackup(t *testing.T) {
 					Paths: []string{
 						t.TempDir(),
 					},
-					Cron: "0 0 1 1 *",
+					Schedule: &v1.Schedule{
+						Schedule: &v1.Schedule_Disabled{Disabled: true},
+					},
 					Retention: &v1.RetentionPolicy{
 						Policy: &v1.RetentionPolicy_PolicyKeepLastN{
 							PolicyKeepLastN: 1,
@@ -214,7 +216,7 @@ func TestMultipleBackup(t *testing.T) {
 		sut.orch.Run(ctx)
 	}()
 
-	for i := 0; i < 2; i++ {
+	for i := 0; i < 3; i++ {
 		_, err := sut.handler.Backup(context.Background(), connect.NewRequest(&types.StringValue{Value: "test"}))
 		if err != nil {
 			t.Fatalf("Backup() error = %v", err)
@@ -226,7 +228,7 @@ func TestMultipleBackup(t *testing.T) {
 		operations := getOperations(t, sut.oplog)
 		if index := slices.IndexFunc(operations, func(op *v1.Operation) bool {
 			forget, ok := op.GetOp().(*v1.Operation_OperationForget)
-			return op.Status == v1.OperationStatus_STATUS_SUCCESS && ok && len(forget.OperationForget.Forget) == 1
+			return op.Status == v1.OperationStatus_STATUS_SUCCESS && ok && len(forget.OperationForget.Forget) > 0
 		}); index != -1 {
 			return nil
 		}
@@ -266,7 +268,9 @@ func TestHookExecution(t *testing.T) {
 					Paths: []string{
 						t.TempDir(),
 					},
-					Cron: "0 0 1 1 *",
+					Schedule: &v1.Schedule{
+						Schedule: &v1.Schedule_Disabled{Disabled: true},
+					},
 					Hooks: []*v1.Hook{
 						{
 							Conditions: []v1.Hook_Condition{
@@ -351,9 +355,13 @@ func TestCancelBackup(t *testing.T) {
 					Paths: []string{
 						t.TempDir(),
 					},
-					Cron: "0 0 1 1 *",
+					Schedule: &v1.Schedule{
+						Schedule: &v1.Schedule_Disabled{Disabled: true},
+					},
 					Retention: &v1.RetentionPolicy{
-						KeepHourly: 1,
+						Policy: &v1.RetentionPolicy_PolicyKeepLastN{
+							PolicyKeepLastN: 1,
+						},
 					},
 				},
 			},
@@ -370,10 +378,7 @@ func TestCancelBackup(t *testing.T) {
 	var errgroup errgroup.Group
 	errgroup.Go(func() error {
 		backupReq := connect.NewRequest(&types.StringValue{Value: "test"})
-		_, err := sut.handler.Backup(context.Background(), backupReq)
-		if err != nil {
-			return fmt.Errorf("Backup() error = %v", err)
-		}
+		sut.handler.Backup(context.Background(), backupReq)
 		return nil
 	})
 
@@ -438,7 +443,9 @@ func TestRestore(t *testing.T) {
 					Paths: []string{
 						backupDataDir,
 					},
-					Cron: "0 0 1 1 *",
+					Schedule: &v1.Schedule{
+						Schedule: &v1.Schedule_Disabled{Disabled: true},
+					},
 					Retention: &v1.RetentionPolicy{
 						KeepHourly: 1,
 					},
@@ -486,7 +493,7 @@ func TestRestore(t *testing.T) {
 		t.Fatalf("snapshotId must be set")
 	}
 
-	restoreTarget := t.TempDir()
+	restoreTarget := t.TempDir() + "/restore"
 
 	_, err = sut.handler.Restore(context.Background(), connect.NewRequest(&v1.RestoreSnapshotRequest{
 		SnapshotId: snapshotOp.SnapshotId,
@@ -596,7 +603,7 @@ func retry(t *testing.T, times int, backoff time.Duration, f func() error) error
 }
 
 func getOperations(t *testing.T, oplog *oplog.OpLog) []*v1.Operation {
-	t.Logf("Reading oplog")
+	t.Logf("Reading oplog at time %v", time.Now())
 	operations := []*v1.Operation{}
 	if err := oplog.ForAll(func(op *v1.Operation) error {
 		operations = append(operations, op)

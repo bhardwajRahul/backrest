@@ -8,6 +8,7 @@ import (
 	"github.com/garethgeorge/backrest/internal/hook"
 	"github.com/garethgeorge/backrest/internal/oplog"
 	"github.com/garethgeorge/backrest/internal/orchestrator/repo"
+	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -15,13 +16,15 @@ var NeverScheduledTask = ScheduledTask{}
 
 const (
 	PlanForUnassociatedOperations = "_unassociated_"
+	PlanForSystemTasks            = "_system_" // plan for system tasks e.g. garbage collection, prune, stats, etc.
 
-	TaskPriorityStats          = -1
-	TaskPriorityDefault        = 0
-	TaskPriorityInteractive    = 1 << 1
+	TaskPriorityStats          = 0
+	TaskPriorityDefault        = 1 << 1 // default priority
 	TaskPriorityForget         = 1 << 2
 	TaskPriorityIndexSnapshots = 1 << 3
-	TaskPriorityPrune          = 1 << 4
+	TaskPriorityCheck          = 1 << 4 // check should always run after prune.
+	TaskPriorityPrune          = 1 << 5
+	TaskPriorityInteractive    = 1 << 6 // highest priority
 )
 
 // TaskRunner is an interface for running tasks. It is used by tasks to create operations and write logs.
@@ -44,6 +47,8 @@ type TaskRunner interface {
 	ScheduleTask(task Task, priority int) error
 	// Config returns the current config.
 	Config() *v1.Config
+	// Logger returns the logger.
+	Logger(ctx context.Context) *zap.Logger
 }
 
 // ScheduledTask is a task that is scheduled to run at a specific time.
@@ -67,7 +72,7 @@ func (s ScheduledTask) Less(other ScheduledTask) bool {
 // Task is a task that can be scheduled to run at a specific time.
 type Task interface {
 	Name() string                                                       // human readable name for this task.
-	Next(now time.Time, runner TaskRunner) ScheduledTask                // returns the next scheduled task.
+	Next(now time.Time, runner TaskRunner) (ScheduledTask, error)       // returns the next scheduled task.
 	Run(ctx context.Context, st ScheduledTask, runner TaskRunner) error // run the task.
 	PlanID() string                                                     // the ID of the plan this task is associated with.
 	RepoID() string                                                     // the ID of the repo this task is associated with.
@@ -99,9 +104,9 @@ type OneoffTask struct {
 	ProtoOp     *v1.Operation // the prototype operation for this class of task.
 }
 
-func (o *OneoffTask) Next(now time.Time, runner TaskRunner) ScheduledTask {
+func (o *OneoffTask) Next(now time.Time, runner TaskRunner) (ScheduledTask, error) {
 	if o.DidSchedule {
-		return NeverScheduledTask
+		return NeverScheduledTask, nil
 	}
 	o.DidSchedule = true
 
@@ -118,7 +123,7 @@ func (o *OneoffTask) Next(now time.Time, runner TaskRunner) ScheduledTask {
 	return ScheduledTask{
 		RunAt: o.RunAt,
 		Op:    op,
-	}
+	}, nil
 }
 
 type GenericOneoffTask struct {

@@ -1,13 +1,14 @@
 package api
 
 import (
+	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
 	"path"
+	"reflect"
 	"time"
 
 	"connectrpc.com/connect"
@@ -191,7 +192,6 @@ func (s *BackrestHandler) ListSnapshotFiles(ctx context.Context, req *connect.Re
 
 // GetOperationEvents implements GET /v1/events/operations
 func (s *BackrestHandler) GetOperationEvents(ctx context.Context, req *connect.Request[emptypb.Empty], resp *connect.ServerStream[v1.OperationEvent]) error {
-
 	errChan := make(chan error, 1)
 	events := make(chan *v1.OperationEvent, 100)
 
@@ -220,23 +220,36 @@ func (s *BackrestHandler) GetOperationEvents(ctx context.Context, req *connect.R
 		select {
 		case events <- event:
 		default:
-			errChan <- errors.New("event buffer overflow, closing stream for client retry and catchup")
+			select {
+			case errChan <- errors.New("event buffer overflow, closing stream for client retry and catchup"):
+			default:
+			}
 		}
 	}
 	s.oplog.Subscribe(&callback)
 	defer s.oplog.Unsubscribe(&callback)
 
-	for {
-		select {
-		case err := <-errChan:
-			return err
-		case <-ctx.Done():
-			return nil
-		case event := <-events:
-			if err := resp.Send(event); err != nil {
-				return fmt.Errorf("failed to write event: %w", err)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case event := <-events:
+				if err := resp.Send(event); err != nil {
+					select {
+					case errChan <- errors.New("failed to send event"):
+					default:
+					}
+				}
 			}
 		}
+	}()
+
+	select {
+	case err := <-errChan:
+		return err
+	case <-ctx.Done():
+		return nil
 	}
 }
 
@@ -246,32 +259,18 @@ func (s *BackrestHandler) GetOperations(ctx context.Context, req *connect.Reques
 	if req.Msg.LastN != 0 {
 		idCollector = indexutil.CollectLastN(int(req.Msg.LastN))
 	}
+	q, err := opSelectorToQuery(req.Msg.Selector)
+	if err != nil {
+		return nil, err
+	}
 
-	var err error
 	var ops []*v1.Operation
 	opCollector := func(op *v1.Operation) error {
 		ops = append(ops, op)
 		return nil
 	}
-	if req.Msg.RepoId != "" && req.Msg.PlanId != "" {
-		return nil, errors.New("cannot specify both repoId and planId")
-	} else if req.Msg.PlanId != "" {
-		err = s.oplog.ForEachByPlan(req.Msg.PlanId, idCollector, opCollector)
-	} else if req.Msg.RepoId != "" {
-		err = s.oplog.ForEachByRepo(req.Msg.RepoId, idCollector, opCollector)
-	} else if req.Msg.SnapshotId != "" {
-		err = s.oplog.ForEachBySnapshotId(req.Msg.SnapshotId, idCollector, opCollector)
-	} else if req.Msg.FlowId != 0 {
-		err = s.oplog.ForEachByFlowId(req.Msg.FlowId, idCollector, opCollector)
-	} else if len(req.Msg.Ids) > 0 {
-		ops = make([]*v1.Operation, 0, len(req.Msg.Ids))
-		for i, id := range req.Msg.Ids {
-			op, err := s.oplog.Get(id)
-			if err != nil {
-				return nil, fmt.Errorf("failed to get operation %d: %w", i, err)
-			}
-			ops = append(ops, op)
-		}
+	if !reflect.DeepEqual(q, oplog.Query{}) {
+		err = s.oplog.ForEach(q, idCollector, opCollector)
 	} else {
 		err = s.oplog.ForAll(opCollector)
 	}
@@ -344,35 +343,60 @@ func (s *BackrestHandler) Forget(ctx context.Context, req *connect.Request[v1.Fo
 	return connect.NewResponse(&emptypb.Empty{}), nil
 }
 
-func (s *BackrestHandler) Prune(ctx context.Context, req *connect.Request[types.StringValue]) (*connect.Response[emptypb.Empty], error) {
-	plan, err := s.orchestrator.GetPlan(req.Msg.Value)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get plan %q: %w", req.Msg.Value, err)
+func (s BackrestHandler) DoRepoTask(ctx context.Context, req *connect.Request[v1.DoRepoTaskRequest]) (*connect.Response[emptypb.Empty], error) {
+	var task tasks.Task
+	priority := tasks.TaskPriorityInteractive
+	switch req.Msg.Task {
+	case v1.DoRepoTaskRequest_TASK_CHECK:
+		task = tasks.NewCheckTask(req.Msg.RepoId, tasks.PlanForSystemTasks, true)
+	case v1.DoRepoTaskRequest_TASK_PRUNE:
+		task = tasks.NewPruneTask(req.Msg.RepoId, tasks.PlanForSystemTasks, true)
+		priority |= tasks.TaskPriorityPrune
+	case v1.DoRepoTaskRequest_TASK_STATS:
+		task = tasks.NewStatsTask(req.Msg.RepoId, tasks.PlanForSystemTasks, true)
+		priority |= tasks.TaskPriorityStats
+	case v1.DoRepoTaskRequest_TASK_INDEX_SNAPSHOTS:
+		task = tasks.NewOneoffIndexSnapshotsTask(req.Msg.RepoId, time.Now())
+		priority |= tasks.TaskPriorityIndexSnapshots
+	case v1.DoRepoTaskRequest_TASK_UNLOCK:
+		repo, err := s.orchestrator.GetRepoOrchestrator(req.Msg.RepoId)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get repo %q: %w", req.Msg.RepoId, err)
+		}
+		if err := repo.Unlock(ctx); err != nil {
+			return nil, fmt.Errorf("failed to unlock repo %q: %w", req.Msg.RepoId, err)
+		}
+		return connect.NewResponse(&emptypb.Empty{}), nil
+	default:
+		return nil, fmt.Errorf("unknown task %v", req.Msg.Task.String())
 	}
 
-	at := time.Now()
+	var err error
 	wait := make(chan struct{})
-	s.orchestrator.ScheduleTask(tasks.NewOneoffPruneTask(plan.Repo, plan.Id, 0, at, true), tasks.TaskPriorityInteractive+tasks.TaskPriorityPrune, func(e error) {
+	if err := s.orchestrator.ScheduleTask(task, priority, func(e error) {
 		err = e
 		close(wait)
-	})
+	}); err != nil {
+		return nil, err
+	}
 	<-wait
-
+	if err != nil {
+		return nil, err
+	}
 	return connect.NewResponse(&emptypb.Empty{}), nil
 }
 
 func (s *BackrestHandler) Restore(ctx context.Context, req *connect.Request[v1.RestoreSnapshotRequest]) (*connect.Response[emptypb.Empty], error) {
 	if req.Msg.Target == "" {
-		req.Msg.Target = path.Join(os.Getenv("HOME"), "Downloads")
+		req.Msg.Target = path.Join(os.Getenv("HOME"), "Downloads", fmt.Sprintf("restic-restore-%v", time.Now().Format("2006-01-02T15-04-05")))
 	}
 	if req.Msg.Path == "" {
 		req.Msg.Path = "/"
 	}
 
-	target := path.Join(req.Msg.Target, fmt.Sprintf("restic-restore-%v", time.Now().Format("2006-01-02T15-04-05")))
-	_, err := os.Stat(target)
-	if !errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("restore target dir %q already exists", req.Msg.Target)
+	// prevent restoring to a directory that already exists
+	if _, err := os.Stat(req.Msg.Target); err == nil {
+		return nil, fmt.Errorf("target directory %q already exists", req.Msg.Target)
 	}
 
 	at := time.Now()
@@ -381,35 +405,74 @@ func (s *BackrestHandler) Restore(ctx context.Context, req *connect.Request[v1.R
 	if err != nil {
 		return nil, fmt.Errorf("failed to get flow ID for snapshot %q: %w", req.Msg.SnapshotId, err)
 	}
-	s.orchestrator.ScheduleTask(tasks.NewOneoffRestoreTask(req.Msg.RepoId, req.Msg.PlanId, flowID, at, req.Msg.SnapshotId, req.Msg.Path, target), tasks.TaskPriorityInteractive+tasks.TaskPriorityDefault)
+	s.orchestrator.ScheduleTask(tasks.NewOneoffRestoreTask(req.Msg.RepoId, req.Msg.PlanId, flowID, at, req.Msg.SnapshotId, req.Msg.Path, req.Msg.Target), tasks.TaskPriorityInteractive+tasks.TaskPriorityDefault)
 
 	return connect.NewResponse(&emptypb.Empty{}), nil
 }
 
-func (s *BackrestHandler) Unlock(ctx context.Context, req *connect.Request[types.StringValue]) (*connect.Response[emptypb.Empty], error) {
-	repo, err := s.orchestrator.GetRepoOrchestrator(req.Msg.Value)
+func (s *BackrestHandler) RunCommand(ctx context.Context, req *connect.Request[v1.RunCommandRequest], resp *connect.ServerStream[types.BytesValue]) error {
+	repo, err := s.orchestrator.GetRepoOrchestrator(req.Msg.RepoId)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get repo %q: %w", req.Msg.Value, err)
+		return fmt.Errorf("failed to get repo %q: %w", req.Msg.RepoId, err)
 	}
 
-	if err := repo.Unlock(context.Background()); err != nil {
-		return nil, fmt.Errorf("failed to unlock repo %q: %w", req.Msg.Value, err)
+	ctx, cancel := context.WithCancel(ctx)
+
+	outputs := make(chan []byte, 100)
+	errChan := make(chan error, 1)
+	go func() {
+		start := time.Now()
+		if err := repo.RunCommand(ctx, req.Msg.Command, func(output []byte) {
+			outputs <- bytes.Clone(output)
+		}); err != nil {
+			errChan <- err
+		}
+		outputs <- []byte("took " + time.Since(start).String())
+		cancel()
+	}()
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	bufSize := 32 * 1024
+	buf := make([]byte, 0, bufSize)
+
+	flush := func() error {
+		if len(buf) > 0 {
+			if err := resp.Send(&types.BytesValue{Value: buf}); err != nil {
+				return fmt.Errorf("failed to write output: %w", err)
+			}
+			buf = buf[:0]
+		}
+		return nil
 	}
 
-	return connect.NewResponse(&emptypb.Empty{}), nil
-}
-
-func (s *BackrestHandler) Stats(ctx context.Context, req *connect.Request[types.StringValue]) (*connect.Response[emptypb.Empty], error) {
-	at := time.Now()
-	var err error
-	wait := make(chan struct{})
-	s.orchestrator.ScheduleTask(tasks.NewOneoffStatsTask(req.Msg.Value, tasks.PlanForUnassociatedOperations, at), tasks.TaskPriorityInteractive+tasks.TaskPriorityStats, func(e error) {
-		err = e
-		close(wait)
-	})
-	<-wait
-	return connect.NewResponse(&emptypb.Empty{}), err
-
+	for {
+		select {
+		case err := <-errChan:
+			if err := flush(); err != nil {
+				return err
+			}
+			return err
+		case <-ctx.Done():
+			return flush()
+		case output := <-outputs:
+			if len(output)+len(buf) > bufSize {
+				flush()
+			}
+			if len(output) > bufSize {
+				if err := resp.Send(&types.BytesValue{Value: output}); err != nil {
+					return fmt.Errorf("failed to write output: %w", err)
+				}
+				continue
+			}
+			buf = append(buf, output...)
+		case <-ticker.C:
+			if len(buf) > 0 {
+				flush()
+			}
+		}
+	}
 }
 
 func (s *BackrestHandler) Cancel(ctx context.Context, req *connect.Request[types.Int64Value]) (*connect.Response[emptypb.Empty], error) {
@@ -424,10 +487,6 @@ func (s *BackrestHandler) ClearHistory(ctx context.Context, req *connect.Request
 	var err error
 	var ids []int64
 
-	if len(req.Msg.Ops) != 0 {
-		ids = append(ids, req.Msg.Ops...)
-	}
-
 	opCollector := func(op *v1.Operation) error {
 		if !req.Msg.OnlyFailed || op.Status == v1.OperationStatus_STATUS_ERROR {
 			ids = append(ids, op.Id)
@@ -435,14 +494,15 @@ func (s *BackrestHandler) ClearHistory(ctx context.Context, req *connect.Request
 		return nil
 	}
 
-	if req.Msg.RepoId != "" && req.Msg.PlanId != "" {
-		return nil, errors.New("cannot specify both repoId and planId")
-	} else if req.Msg.PlanId != "" {
-		err = s.oplog.ForEachByPlan(req.Msg.PlanId, indexutil.CollectAll(), opCollector)
-	} else if req.Msg.RepoId != "" {
-		err = s.oplog.ForEachByRepo(req.Msg.RepoId, indexutil.CollectAll(), opCollector)
+	q, err := opSelectorToQuery(req.Msg.Selector)
+	if err != nil {
+		return nil, err
 	}
-
+	if !reflect.DeepEqual(q, oplog.Query{}) {
+		err = s.oplog.ForEach(q, indexutil.CollectAll(), opCollector)
+	} else {
+		err = s.oplog.ForAll(opCollector)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to get operations to delete: %w", err)
 	}
@@ -477,9 +537,7 @@ func (s *BackrestHandler) GetDownloadURL(ctx context.Context, req *connect.Reque
 	if !ok {
 		return nil, fmt.Errorf("operation %v is not a restore operation", req.Msg.Value)
 	}
-	b := make([]byte, 8)
-	binary.BigEndian.PutUint64(b, uint64(op.Id))
-	signature, err := generateSignature(b)
+	signature, err := signInt64(op.Id) // the signature authenticates the download URL. Note that the shared URL will be valid for any downloader.
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate signature: %w", err)
 	}
@@ -502,4 +560,21 @@ func (s *BackrestHandler) PathAutocomplete(ctx context.Context, path *connect.Re
 	}
 
 	return connect.NewResponse(&types.StringList{Values: paths}), nil
+}
+
+func opSelectorToQuery(sel *v1.OpSelector) (oplog.Query, error) {
+	if sel == nil {
+		return oplog.Query{}, errors.New("empty selector")
+	}
+	q := oplog.Query{
+		RepoId:     sel.RepoId,
+		PlanId:     sel.PlanId,
+		SnapshotId: sel.SnapshotId,
+		FlowId:     sel.FlowId,
+	}
+	if len(sel.Ids) > 0 && !reflect.DeepEqual(q, oplog.Query{}) {
+		return oplog.Query{}, errors.New("cannot specify both query and ids")
+	}
+	q.Ids = sel.Ids
+	return q, nil
 }

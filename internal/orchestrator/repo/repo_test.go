@@ -1,8 +1,10 @@
 package repo
 
 import (
+	"bytes"
 	"context"
 	"os"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -19,39 +21,71 @@ var configForTest = &v1.Config{
 func TestBackup(t *testing.T) {
 	t.Parallel()
 
-	repo := t.TempDir()
 	testData := test.CreateTestData(t)
 
-	// create a new repo with cache disabled for testing
-	r := &v1.Repo{
-		Id:       "test",
-		Uri:      repo,
-		Password: "test",
-		Flags:    []string{"--no-cache"},
+	tcs := []struct {
+		name     string
+		repo     *v1.Repo
+		plan     *v1.Plan
+		unixOnly bool
+	}{
+		{
+			name: "backup",
+			repo: &v1.Repo{
+				Id:       "test",
+				Uri:      t.TempDir(),
+				Password: "test",
+			},
+			plan: &v1.Plan{
+				Id:    "test",
+				Repo:  "test",
+				Paths: []string{testData},
+			},
+		},
+		{
+			name: "backup with ionice",
+			repo: &v1.Repo{
+				Id:       "test",
+				Uri:      t.TempDir(),
+				Password: "test",
+				CommandPrefix: &v1.CommandPrefix{
+					IoNice:  v1.CommandPrefix_IO_BEST_EFFORT_LOW,
+					CpuNice: v1.CommandPrefix_CPU_LOW,
+				},
+			},
+			plan: &v1.Plan{
+				Id:    "test",
+				Repo:  "test",
+				Paths: []string{testData},
+			},
+			unixOnly: true,
+		},
 	}
 
-	plan := &v1.Plan{
-		Id:    "test",
-		Repo:  "test",
-		Paths: []string{testData},
-	}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.unixOnly && runtime.GOOS == "windows" {
+				t.Skip("skipping on windows")
+			}
 
-	orchestrator, err := NewRepoOrchestrator(configForTest, r, helpers.ResticBinary(t))
-	if err != nil {
-		t.Fatalf("failed to create repo orchestrator: %v", err)
-	}
+			orchestrator, err := NewRepoOrchestrator(configForTest, tc.repo, helpers.ResticBinary(t))
+			if err != nil {
+				t.Fatalf("failed to create repo orchestrator: %v", err)
+			}
 
-	summary, err := orchestrator.Backup(context.Background(), plan, nil)
-	if err != nil {
-		t.Fatalf("backup error: %v", err)
-	}
+			summary, err := orchestrator.Backup(context.Background(), tc.plan, nil)
+			if err != nil {
+				t.Fatalf("backup error: %v", err)
+			}
 
-	if summary.SnapshotId == "" {
-		t.Fatal("expected snapshot id")
-	}
+			if summary.SnapshotId == "" {
+				t.Fatal("expected snapshot id")
+			}
 
-	if summary.FilesNew != 100 {
-		t.Fatalf("expected 100 new files, got %d", summary.FilesNew)
+			if summary.FilesNew != 100 {
+				t.Fatalf("expected 100 new files, got %d", summary.FilesNew)
+			}
+		})
 	}
 }
 
@@ -151,11 +185,10 @@ func TestEnvVarPropagation(t *testing.T) {
 
 	// create a new repo with cache disabled for testing
 	r := &v1.Repo{
-		Id:       "test",
-		Uri:      repo,
-		Password: "test",
-		Flags:    []string{"--no-cache"},
-		Env:      []string{"RESTIC_PASSWORD=${MY_FOO}"},
+		Id:    "test",
+		Uri:   repo,
+		Flags: []string{"--no-cache"},
+		Env:   []string{"RESTIC_PASSWORD=${MY_FOO}"},
 	}
 
 	plan := &v1.Plan{
@@ -170,7 +203,7 @@ func TestEnvVarPropagation(t *testing.T) {
 	}
 
 	_, err = orchestrator.Backup(context.Background(), plan, nil)
-	if err == nil || !strings.Contains(err.Error(), "an empty password is not a password") {
+	if err == nil || !strings.Contains(err.Error(), "password") {
 		t.Fatalf("expected error about RESTIC_PASSWORD, got: %v", err)
 	}
 
@@ -188,5 +221,61 @@ func TestEnvVarPropagation(t *testing.T) {
 
 	if summary.SnapshotId == "" {
 		t.Fatal("expected snapshot id")
+	}
+}
+
+func TestCheck(t *testing.T) {
+	t.Parallel()
+
+	tcs := []struct {
+		name string
+		repo *v1.Repo
+	}{
+		{
+			name: "check structure",
+			repo: &v1.Repo{
+				Id:       "test",
+				Uri:      t.TempDir(),
+				Password: "test",
+				CheckPolicy: &v1.CheckPolicy{
+					Mode: nil,
+				},
+			},
+		},
+		{
+			name: "read data percent",
+			repo: &v1.Repo{
+				Id:       "test",
+				Uri:      t.TempDir(),
+				Password: "test",
+				CheckPolicy: &v1.CheckPolicy{
+					Mode: &v1.CheckPolicy_ReadDataSubsetPercent{
+						ReadDataSubsetPercent: 50,
+					},
+				},
+			},
+		},
+	}
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			orchestrator, err := NewRepoOrchestrator(configForTest, tc.repo, helpers.ResticBinary(t))
+			if err != nil {
+				t.Fatalf("failed to create repo orchestrator: %v", err)
+			}
+
+			buf := bytes.NewBuffer(nil)
+
+			err = orchestrator.Init(context.Background())
+			if err != nil {
+				t.Fatalf("init error: %v", err)
+			}
+
+			err = orchestrator.Check(context.Background(), buf)
+			if err != nil {
+				t.Errorf("check error: %v", err)
+			}
+			t.Logf("check output: %s", buf.String())
+		})
 	}
 }

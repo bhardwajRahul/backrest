@@ -23,6 +23,7 @@ type HookVars struct {
 	SnapshotId    string                      // the snapshot ID that triggered the hook.
 	SnapshotStats *restic.BackupProgressEntry // the summary of the backup operation.
 	CurTime       time.Time                   // the current time as time.Time
+	Duration      time.Duration               // the duration of the operation that triggered the hook.
 	Error         string                      // the error that caused the hook to run as a string.
 }
 
@@ -36,6 +37,20 @@ func (v HookVars) EventName(cond v1.Hook_Condition) string {
 		return "error"
 	case v1.Hook_CONDITION_SNAPSHOT_ERROR:
 		return "snapshot error"
+	case v1.Hook_CONDITION_SNAPSHOT_WARNING:
+		return "snapshot warning"
+	case v1.Hook_CONDITION_CHECK_START:
+		return "check start"
+	case v1.Hook_CONDITION_CHECK_ERROR:
+		return "check error"
+	case v1.Hook_CONDITION_CHECK_SUCCESS:
+		return "check success"
+	case v1.Hook_CONDITION_PRUNE_START:
+		return "prune start"
+	case v1.Hook_CONDITION_PRUNE_ERROR:
+		return "prune error"
+	case v1.Hook_CONDITION_PRUNE_SUCCESS:
+		return "prune success"
 	default:
 		return "unknown"
 	}
@@ -43,6 +58,10 @@ func (v HookVars) EventName(cond v1.Hook_Condition) string {
 
 func (v HookVars) FormatTime(t time.Time) string {
 	return t.Format(time.RFC3339)
+}
+
+func (v HookVars) FormatDuration(d time.Duration) string {
+	return d.Truncate(time.Millisecond).String()
 }
 
 func (v HookVars) number(n any) int {
@@ -91,16 +110,10 @@ func (v HookVars) Summary() (string, error) {
 	switch v.Event {
 	case v1.Hook_CONDITION_SNAPSHOT_START:
 		return v.renderTemplate(templateForSnapshotStart)
-	case v1.Hook_CONDITION_SNAPSHOT_END:
+	case v1.Hook_CONDITION_SNAPSHOT_END, v1.Hook_CONDITION_SNAPSHOT_WARNING, v1.Hook_CONDITION_SNAPSHOT_SUCCESS:
 		return v.renderTemplate(templateForSnapshotEnd)
-	case v1.Hook_CONDITION_ANY_ERROR:
-		return v.renderTemplate(templateForError)
-	case v1.Hook_CONDITION_SNAPSHOT_ERROR:
-		return v.renderTemplate(templateForError)
-	case v1.Hook_CONDITION_SNAPSHOT_WARNING:
-		return v.renderTemplate(templateForError)
 	default:
-		return "unknown event", nil
+		return v.renderTemplate(templateDefault)
 	}
 }
 
@@ -118,15 +131,27 @@ func (v HookVars) renderTemplate(templ string) (string, error) {
 	return buf.String(), nil
 }
 
-var templateForSnapshotEnd = `
-Backrest Notification for Snapshot End
-Task: "{{ .Task }}" at {{ .FormatTime .CurTime }}
+var templateDefault = `
+{{ if .Error -}}
+Backrest Error
+Task: {{ .Task }} at {{ .FormatTime .CurTime }}
 Event: {{ .EventName .Event }}
-Repo: {{ .Repo.Id }} 
-Plan: {{ .Plan.Id }} 
+Repo: {{ .Repo.Id }}
+Error: {{ .Error }}
+{{ else -}}
+Backrest Notification
+Task: {{ .Task }} at {{ .FormatTime .CurTime }}
+Event: {{ .EventName .Event }}
+{{ end }}
+`
+
+var templateForSnapshotEnd = `
+Backrest Snapshot Notification
+Task: {{ .Task }} at {{ .FormatTime .CurTime }}
+Event: {{ .EventName .Event }}
 Snapshot: {{ .SnapshotId }}
 {{ if .Error -}}
-Failed to create snapshot: {{ .Error }}
+Error: {{ .Error }}
 {{ else -}}
 {{ if .SnapshotStats -}}
 
@@ -147,14 +172,6 @@ Backup Statistics:
 - Total duration: {{ .SnapshotStats.TotalDuration }}s
 {{ end }}
 {{ end }}`
-
-var templateForError = `
-Backrest Notification for Error
-Task: "{{ .Task }}" at {{ .FormatTime .CurTime }}
-{{ if .Error -}}
-Error: {{ .Error }}
-{{ end }}
-`
 
 var templateForSnapshotStart = `
 Backrest Notification for Snapshot Start

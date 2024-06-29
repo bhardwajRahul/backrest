@@ -4,14 +4,12 @@ import {
   OperationEvent,
   OperationEventType,
 } from "../../gen/ts/v1/operations_pb";
-import {
-  Empty,
-  List,
-} from "antd";
+import { Empty, List } from "antd";
 import {
   BackupInfo,
   BackupInfoCollector,
   getOperations,
+  matchSelector,
   subscribeToOperations,
   unsubscribeFromOperations,
 } from "../state/oplog";
@@ -30,8 +28,8 @@ export const OperationList = ({
 }: React.PropsWithoutRef<{
   req?: GetOperationsRequest;
   useBackups?: BackupInfo[];
-  showPlan?: boolean,
-  filter?: (op: Operation) => boolean, // if provided, only operations that pass this filter will be displayed.
+  showPlan?: boolean;
+  filter?: (op: Operation) => boolean; // if provided, only operations that pass this filter will be displayed.
 }>) => {
   const alertApi = useAlertApi();
 
@@ -42,44 +40,24 @@ export const OperationList = ({
 
     // track backups for this operation tree view.
     useEffect(() => {
-      if (!req) {
-        return;
-      }
+      const backupCollector = new BackupInfoCollector();
+      backupCollector.subscribe(
+        _.debounce(
+          () => {
+            let backups = backupCollector.getAll();
+            backups.sort((a, b) => {
+              return b.startTimeMs - a.startTimeMs;
+            });
+            setBackups(backups);
+          },
+          100,
+          { leading: true, trailing: true }
+        )
+      );
 
-      const backupCollector = new BackupInfoCollector(filter);
-      const lis = (opEvent: OperationEvent) => {
-        if (!!req.planId && opEvent.operation!.planId !== req.planId) {
-          return;
-        }
-        if (!!req.repoId && opEvent.operation!.repoId !== req.repoId) {
-          return;
-        }
-        if (opEvent.type !== OperationEventType.EVENT_DELETED) {
-          backupCollector.addOperation(opEvent.type!, opEvent.operation!);
-        } else {
-          backupCollector.removeOperation(opEvent.operation!);
-        }
-      };
-      subscribeToOperations(lis);
-
-      backupCollector.subscribe(_.debounce(() => {
-        let backups = backupCollector.getAll();
-        backups.sort((a, b) => {
-          return b.startTimeMs - a.startTimeMs;
-        });
-        setBackups(backups);
-      }, 50));
-
-      getOperations(req)
-        .then((ops) => {
-          backupCollector.bulkAddOperations(ops);
-        })
-        .catch((e) => {
-          alertApi!.error("Failed to fetch operations: " + e.message);
-        });
-      return () => {
-        unsubscribeFromOperations(lis);
-      };
+      return backupCollector.collectFromRequest(req, (err) => {
+        alertApi!.error("API error: " + err.message);
+      });
     }, [JSON.stringify(req)]);
   } else {
     backups = [...(useBackups || [])];
@@ -94,17 +72,24 @@ export const OperationList = ({
     );
   }
 
-  let operations = backups.flatMap((b) => b.operations)
+  let operations = backups.flatMap((b) => b.operations);
   operations.sort((a, b) => {
-    return Number(b.unixTimeStartMs - a.unixTimeStartMs)
+    return Number(b.unixTimeStartMs - a.unixTimeStartMs);
   });
   return (
     <List
       itemLayout="horizontal"
       size="small"
       dataSource={operations}
-      renderItem={(op) => {
-        return <OperationRow alertApi={alertApi!} key={op.id} operation={op} showPlan={showPlan || false} />
+      renderItem={(op, index) => {
+        return (
+          <OperationRow
+            alertApi={alertApi!}
+            key={op.id}
+            operation={op}
+            showPlan={showPlan || false}
+          />
+        );
       }}
       pagination={
         operations.length > 25
@@ -114,4 +99,3 @@ export const OperationList = ({
     />
   );
 };
-

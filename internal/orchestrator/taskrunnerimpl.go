@@ -1,11 +1,16 @@
 package orchestrator
 
 import (
+	"context"
+	"time"
+
 	v1 "github.com/garethgeorge/backrest/gen/go/v1"
 	"github.com/garethgeorge/backrest/internal/hook"
 	"github.com/garethgeorge/backrest/internal/oplog"
+	"github.com/garethgeorge/backrest/internal/orchestrator/logging"
 	"github.com/garethgeorge/backrest/internal/orchestrator/repo"
 	"github.com/garethgeorge/backrest/internal/orchestrator/tasks"
+	"go.uber.org/zap"
 )
 
 // taskRunnerImpl is an implementation of TaskRunner for the default orchestrator.
@@ -65,6 +70,11 @@ func (t *taskRunnerImpl) OpLog() *oplog.OpLog {
 }
 
 func (t *taskRunnerImpl) ExecuteHooks(events []v1.Hook_Condition, vars hook.HookVars) error {
+	vars.Task = t.t.Name()
+	if t.op != nil {
+		vars.Duration = time.Since(time.UnixMilli(t.op.UnixTimeStartMs))
+	}
+
 	repoID := t.t.RepoID()
 	planID := t.t.PlanID()
 	var repo *v1.Repo
@@ -77,11 +87,7 @@ func (t *taskRunnerImpl) ExecuteHooks(events []v1.Hook_Condition, vars hook.Hook
 		}
 	}
 	if planID != "" {
-		var err error
-		plan, err = t.FindPlan()
-		if err != nil {
-			return err
-		}
+		plan, _ = t.FindPlan()
 	}
 	var flowID int64
 	if t.op != nil {
@@ -113,4 +119,8 @@ func (t *taskRunnerImpl) Config() *v1.Config {
 	}
 	t.config = t.orchestrator.Config()
 	return t.config
+}
+
+func (t *taskRunnerImpl) Logger(ctx context.Context) *zap.Logger {
+	return logging.Logger(ctx).Named(t.t.Name())
 }

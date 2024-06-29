@@ -44,11 +44,12 @@ func TestResticBackup(t *testing.T) {
 	helpers.CreateUnreadable(t, testDataUnreadable+"/unreadable")
 
 	var tests = []struct {
-		name    string
-		opts    []GenericOption
-		paths   []string
-		files   int64 // expected files at the end of the backup
-		wantErr bool
+		name     string
+		opts     []GenericOption
+		paths    []string
+		files    int64 // expected files at the end of the backup
+		wantErr  bool
+		unixOnly bool
 	}{
 		{
 			name:  "no options",
@@ -86,10 +87,32 @@ func TestResticBackup(t *testing.T) {
 			opts:    []GenericOption{},
 			wantErr: true,
 		},
+		{
+			name:  "with wrapper process",
+			paths: []string{testData},
+			opts: []GenericOption{
+				WithPrefixCommand("nice", "-n", "19"),
+			},
+			files:    100,
+			unixOnly: true,
+		},
+		{
+			name:  "with invalid wrapper process",
+			paths: []string{testData},
+			opts: []GenericOption{
+				WithPrefixCommand("invalid-wrapper"),
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if runtime.GOOS == "windows" && tc.unixOnly {
+				t.Skip("test is unix only")
+			}
+
 			gotEvent := false
 			summary, err := r.Backup(context.Background(), tc.paths, func(event *BackupProgressEntry) {
 				t.Logf("backup event: %v", event)
@@ -464,6 +487,34 @@ func TestResticStats(t *testing.T) {
 	}
 	if stats.TotalBlobCount == 0 {
 		t.Errorf("wanted non-zero total blob count, got: %d", stats.TotalBlobCount)
+	}
+}
+
+func TestResticCheck(t *testing.T) {
+	t.Parallel()
+
+	repo := t.TempDir()
+	r := NewRepo(helpers.ResticBinary(t), repo, WithFlags("--no-cache"), WithEnv("RESTIC_PASSWORD=test"))
+	if err := r.Init(context.Background()); err != nil {
+		t.Fatalf("failed to init repo: %v", err)
+	}
+
+	testData := helpers.CreateTestData(t)
+
+	_, err := r.Backup(context.Background(), []string{testData}, nil)
+	if err != nil {
+		t.Fatalf("failed to backup and create new snapshot: %v", err)
+	}
+
+	// check repo
+	output := bytes.NewBuffer(nil)
+	if err := r.Check(context.Background(), output, WithFlags("--read-data")); err != nil {
+		t.Fatalf("failed to check repo: %v", err)
+	}
+
+	wantStr := "no errors were found"
+	if !bytes.Contains(output.Bytes(), []byte(wantStr)) {
+		t.Errorf("wanted output to contain 'no errors were found', got: %s", output.String())
 	}
 }
 

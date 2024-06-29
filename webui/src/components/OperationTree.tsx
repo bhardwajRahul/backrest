@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   BackupInfo,
   BackupInfoCollector,
@@ -6,6 +6,7 @@ import {
   displayTypeToString,
   getOperations,
   getTypeForDisplay,
+  matchSelector,
   shouldHideOperation,
   subscribeToOperations,
   unsubscribeFromOperations,
@@ -26,10 +27,19 @@ import {
   QuestionOutlined,
   SaveOutlined,
 } from "@ant-design/icons";
-import { OperationEvent, OperationEventType, OperationStatus } from "../../gen/ts/v1/operations_pb";
+import {
+  OperationEvent,
+  OperationEventType,
+  OperationStatus,
+} from "../../gen/ts/v1/operations_pb";
 import { useAlertApi } from "./Alerts";
 import { OperationList } from "./OperationList";
-import { ClearHistoryRequest, ForgetRequest, GetOperationsRequest } from "../../gen/ts/v1/service_pb";
+import {
+  ClearHistoryRequest,
+  ForgetRequest,
+  GetOperationsRequest,
+  OpSelector,
+} from "../../gen/ts/v1/service_pb";
 import { isMobile } from "../lib/browserutil";
 import { useShowModal } from "./ModalManager";
 import { backrestService } from "../api";
@@ -44,151 +54,143 @@ export const OperationTree = ({
 }: React.PropsWithoutRef<{ req: GetOperationsRequest }>) => {
   const alertApi = useAlertApi();
   const showModal = useShowModal();
-  const [loading, setLoading] = useState(true);
   const [backups, setBackups] = useState<BackupInfo[]>([]);
   const [selectedBackupId, setSelectedBackupId] = useState<string | null>(null);
 
   // track backups for this operation tree view.
   useEffect(() => {
     setSelectedBackupId(null);
+
     const backupCollector = new BackupInfoCollector();
-    const lis = (opEvent: OperationEvent) => {
-      if (!!req.planId && opEvent.operation!.planId !== req.planId) {
-        return;
-      }
-      if (!!req.repoId && opEvent.operation!.repoId !== req.repoId) {
-        return;
-      }
-      if (opEvent.type !== OperationEventType.EVENT_DELETED) {
-        backupCollector.addOperation(opEvent.type!, opEvent.operation!);
-      } else {
-        backupCollector.removeOperation(opEvent.operation!);
-      }
-    };
-    subscribeToOperations(lis);
+    backupCollector.subscribe(
+      _.debounce(
+        () => {
+          let backups = backupCollector.getAll();
+          backups.sort((a, b) => {
+            return b.startTimeMs - a.startTimeMs;
+          });
+          setBackups(backups);
+        },
+        100,
+        { leading: true, trailing: true }
+      )
+    );
 
-    backupCollector.subscribe(_.debounce(() => {
-      let backups = backupCollector.getAll();
-      backups.sort((a, b) => {
-        return b.startTimeMs - a.startTimeMs;
-      });
-      setBackups(backups);
-    }, 50));
-
-    getOperations(req)
-      .then((ops) => {
-        backupCollector.bulkAddOperations(ops);
-      })
-      .catch((e) => {
-        alertApi!.error("Failed to fetch operations: " + e.messag);
-      }).finally(() => {
-        setLoading(false);
-      });
-    return () => {
-      unsubscribeFromOperations(lis);
-    };
+    return backupCollector.collectFromRequest(req, (err) => {
+      alertApi!.error("API error: " + err.message);
+    });
   }, [JSON.stringify(req)]);
 
-  const treeData = useMemo(() => {
-    return buildTreePlan(backups);
+  const [treeData, defaultExpanded] = useMemo(() => {
+    return buildTreeInstanceID(backups);
   }, [backups]);
 
   if (backups.length === 0) {
     return (
-      <Empty
-        description={loading ? "Loading..." : "No backups yet."}
-        image={Empty.PRESENTED_IMAGE_SIMPLE}
-      ></Empty>
+      <Empty description={""} image={Empty.PRESENTED_IMAGE_SIMPLE}></Empty>
     );
   }
 
   const useMobileLayout = isMobile();
 
-  const backupTree = <Tree<OpTreeNode>
-    treeData={treeData}
-    showIcon
-    defaultExpandedKeys={backups.slice(0, Math.min(5, backups.length)).map((b) => b.id!)}
-    onSelect={(keys, info) => {
-      if (info.selectedNodes.length === 0) return;
-      const backup = info.selectedNodes[0].backup;
-      if (!backup) {
-        setSelectedBackupId(null);
-        return;
-      }
-      setSelectedBackupId(backup.id!);
-
-      if (useMobileLayout) {
-        showModal(
-          <Modal visible={true} footer={null} onCancel={() => { showModal(null); }}>
-            <BackupView backup={backup} />
-          </Modal>
-        );
-      }
-    }}
-    titleRender={(node: OpTreeNode): React.ReactNode => {
-      if (node.title) {
-        return <>{node.title}</>;
-      }
-      if (node.backup) {
-        const b = node.backup;
-        const details: string[] = [];
-
-        if (b.operations.length === 0) {
-          // this happens when all operations in a backup are deleted; it should be hidden until the deletion propagates to a refresh of the tree layout.
-          return null;
+  const backupTree = (
+    <Tree<OpTreeNode>
+      treeData={treeData}
+      showIcon
+      defaultExpandedKeys={defaultExpanded}
+      onSelect={(keys, info) => {
+        if (info.selectedNodes.length === 0) return;
+        const backup = info.selectedNodes[0].backup;
+        if (!backup) {
+          setSelectedBackupId(null);
+          return;
         }
+        setSelectedBackupId(backup.id!);
 
-        if (b.status === OperationStatus.STATUS_PENDING) {
-          details.push("scheduled, waiting");
-        } else if (b.status === OperationStatus.STATUS_SYSTEM_CANCELLED) {
-          details.push("system cancel");
-        } else if (b.status === OperationStatus.STATUS_USER_CANCELLED) {
-          details.push("cancelled");
-        }
-
-        if (b.backupLastStatus) {
-          if (b.backupLastStatus.entry.case === "summary") {
-            const s = b.backupLastStatus.entry.value;
-            details.push(
-              `${formatBytes(Number(s.totalBytesProcessed))} in ${formatDuration(
-                s.totalDuration! * 1000.0 // convert to ms
-              )}`
-            );
-          } else if (b.backupLastStatus.entry.case === "status") {
-            const s = b.backupLastStatus.entry.value;
-            const percent = Math.floor((Number(s.bytesDone) / Number(s.totalBytes)) * 100);
-            details.push(
-              `${percent}% processed ${formatBytes(
-                Number(s.bytesDone)
-              )} / ${formatBytes(Number(s.totalBytes))}`
-            );
-          }
-        }
-        if (b.snapshotInfo) {
-          details.push(`ID: ${normalizeSnapshotId(b.snapshotInfo.id)}`);
-        }
-
-        let detailsElem: React.ReactNode | null = null;
-        if (details.length > 0) {
-          detailsElem = (
-            <span className="backrest operation-details">
-              [{details.join(", ")}]
-            </span>
+        if (useMobileLayout) {
+          showModal(
+            <Modal
+              visible={true}
+              footer={null}
+              onCancel={() => {
+                showModal(null);
+              }}
+            >
+              <BackupView backup={backup} />
+            </Modal>
           );
         }
+      }}
+      titleRender={(node: OpTreeNode): React.ReactNode => {
+        if (node.title) {
+          return <>{node.title}</>;
+        }
+        if (node.backup) {
+          const b = node.backup;
+          const details: string[] = [];
 
-        const type = getTypeForDisplay(b.operations[0]);
+          if (b.operations.length === 0) {
+            // this happens when all operations in a backup are deleted; it should be hidden until the deletion propagates to a refresh of the tree layout.
+            return null;
+          }
+
+          if (b.status === OperationStatus.STATUS_PENDING) {
+            details.push("scheduled, waiting");
+          } else if (b.status === OperationStatus.STATUS_SYSTEM_CANCELLED) {
+            details.push("system cancel");
+          } else if (b.status === OperationStatus.STATUS_USER_CANCELLED) {
+            details.push("cancelled");
+          }
+
+          if (b.backupLastStatus) {
+            if (b.backupLastStatus.entry.case === "summary") {
+              const s = b.backupLastStatus.entry.value;
+              details.push(
+                `${formatBytes(
+                  Number(s.totalBytesProcessed)
+                )} in ${formatDuration(
+                  s.totalDuration! * 1000.0 // convert to ms
+                )}`
+              );
+            } else if (b.backupLastStatus.entry.case === "status") {
+              const s = b.backupLastStatus.entry.value;
+              const percent = Math.floor(
+                (Number(s.bytesDone) / Number(s.totalBytes)) * 100
+              );
+              details.push(
+                `${percent}% processed ${formatBytes(
+                  Number(s.bytesDone)
+                )} / ${formatBytes(Number(s.totalBytes))}`
+              );
+            }
+          }
+          if (b.snapshotInfo) {
+            details.push(`ID: ${normalizeSnapshotId(b.snapshotInfo.id)}`);
+          }
+
+          let detailsElem: React.ReactNode | null = null;
+          if (details.length > 0) {
+            detailsElem = (
+              <span className="backrest operation-details">
+                [{details.join(", ")}]
+              </span>
+            );
+          }
+
+          const type = getTypeForDisplay(b.operations[0]);
+          return (
+            <>
+              {displayTypeToString(type)} {formatTime(b.displayTime)}{" "}
+              {detailsElem}
+            </>
+          );
+        }
         return (
-          <>
-            {displayTypeToString(type)} {formatTime(b.displayTime)} {detailsElem}
-          </>
+          <span>ERROR: this element should not appear, this is a bug.</span>
         );
-      }
-      return (
-        <span>ERROR: this element should not appear, this is a bug.</span>
-      );
-    }}
-  />;
+      }}
+    />
+  );
 
   if (useMobileLayout) {
     return backupTree;
@@ -196,47 +198,94 @@ export const OperationTree = ({
 
   return (
     <Row>
+      <Col span={12}>{backupTree}</Col>
       <Col span={12}>
-        {backupTree}
+        <BackupViewContainer>
+          {selectedBackupId ? (
+            <BackupView
+              backup={backups.find((b) => b.id === selectedBackupId)}
+            />
+          ) : null}
+        </BackupViewContainer>
       </Col>
-      <Col span={12}>{selectedBackupId ? <BackupView backup={backups.find((b) => b.id === selectedBackupId)} /> : null}</Col>
     </Row>
   );
 };
 
-const buildTreePlan = (operations: BackupInfo[]): OpTreeNode[] => {
+const buildTreeInstanceID = (
+  operations: BackupInfo[]
+): [OpTreeNode[], React.Key[]] => {
   const grouped = _.groupBy(operations, (op) => {
-    return op.operations[0].planId!;
+    return op.operations[0].instanceId!;
   });
 
+  const expanded: React.Key[] = [];
   const entries: OpTreeNode[] = _.map(grouped, (value, key) => {
+    const [children, childrenExpanded] = buildTreePlan(value);
+    expanded.push(...childrenExpanded);
     return {
       key: key,
       title: key,
-      children: buildTreeDay(key, value),
+      children: children,
     };
   });
   if (entries.length === 1) {
-    return entries[0].children!;
+    return [entries[0].children!, expanded];
   }
-  entries.sort(sortByKey);
-  return entries;
+  entries.sort(sortByKeyReverse);
+  return [entries, expanded];
 };
 
-const buildTreeDay = (keyPrefix: string, operations: BackupInfo[]): OpTreeNode[] => {
+const buildTreePlan = (
+  operations: BackupInfo[]
+): [OpTreeNode[], React.Key[]] => {
+  const grouped = _.groupBy(operations, (op) => {
+    return op.operations[0].planId!;
+  });
+  const expanded: React.Key[] = [];
+  const entries: OpTreeNode[] = _.map(grouped, (value, key) => {
+    const [children, childrenExpanded] = buildTreeDay(key, value);
+    expanded.push(...childrenExpanded);
+    return {
+      key: key,
+      title: key,
+      children: children,
+    };
+  });
+  if (entries.length === 1) {
+    return [entries[0].children!, expanded];
+  }
+  entries.sort(sortByKeyReverse);
+  return [entries, expanded];
+};
+
+const buildTreeDay = (
+  keyPrefix: string,
+  operations: BackupInfo[]
+): [OpTreeNode[], React.Key[]] => {
   const grouped = _.groupBy(operations, (op) => {
     return localISOTime(op.displayTime).substring(0, 10);
   });
-
   const entries = _.map(grouped, (value, key) => {
+    const children = buildTreeLeaf(value);
     return {
       key: keyPrefix + key,
       title: formatDate(value[0].displayTime),
-      children: buildTreeLeaf(value),
+      children: children,
     };
   });
   entries.sort(sortByKey);
-  return entries;
+
+  const expanded: React.Key[] = [];
+  let visibleChildCount = 0;
+  for (const e of entries) {
+    expanded.push(e.key);
+    visibleChildCount += e.children!.length;
+    if (visibleChildCount > 5) {
+      break;
+    }
+  }
+  return [entries, expanded];
 };
 
 const buildTreeLeaf = (operations: BackupInfo[]): OpTreeNode[] => {
@@ -271,6 +320,86 @@ const sortByKey = (a: OpTreeNode, b: OpTreeNode) => {
   return 0;
 };
 
+const sortByKeyReverse = (a: OpTreeNode, b: OpTreeNode) => {
+  return -sortByKey(a, b);
+};
+
+const BackupViewContainer = ({ children }: { children: React.ReactNode }) => {
+  const ref = useRef<HTMLDivElement>(null);
+  const innerRef = useRef<HTMLDivElement>(null);
+  const refresh = useState(0)[1];
+  const [offset, setOffset] = useState(0);
+  const [topY, setTopY] = useState(0);
+  const [bottomY, setBottomY] = useState(0);
+
+  useEffect(() => {
+    if (!ref.current || !innerRef.current) {
+      return;
+    }
+
+    let offset = 0;
+
+    // handle scroll events to keep the fixed container in view.
+    const handleScroll = () => {
+      const refRect = ref.current!.getBoundingClientRect();
+      const innerRect = innerRef.current!.getBoundingClientRect();
+
+      let wiggle = Math.max(refRect.height - window.innerHeight, 0);
+      let topY = Math.max(ref.current!.getBoundingClientRect().top, 0);
+      let bottomY = topY;
+      if (topY == 0) {
+        // wiggle only if the top is actually the top edge of the screen.
+        topY -= wiggle;
+        bottomY += wiggle;
+      }
+
+      setTopY(topY);
+      setBottomY(bottomY);
+
+      refresh(Math.random());
+    };
+
+    window.addEventListener("scroll", handleScroll);
+
+    // attach resize observer to ref to update the width of the fixed container.
+    const resizeObserver = new ResizeObserver(() => {
+      handleScroll();
+    });
+    if (ref.current) {
+      resizeObserver.observe(ref.current);
+      resizeObserver.observe(innerRef.current!);
+    }
+    return () => {
+      window.removeEventListener("scroll", handleScroll);
+      resizeObserver.disconnect();
+    };
+  }, [ref.current, innerRef.current]);
+
+  const rect = ref.current?.getBoundingClientRect();
+
+  return (
+    <div
+      ref={ref}
+      style={{
+        width: "100%",
+        height: innerRef.current?.clientHeight,
+      }}
+    >
+      <div
+        ref={innerRef}
+        style={{
+          position: "fixed",
+          top: Math.max(Math.min(rect?.top || 0, bottomY), topY),
+          left: rect?.left,
+          width: ref.current?.clientWidth,
+        }}
+      >
+        {children}
+      </div>
+    </div>
+  );
+};
+
 const BackupView = ({ backup }: { backup?: BackupInfo }) => {
   const alertApi = useAlertApi();
   if (!backup) {
@@ -278,51 +407,69 @@ const BackupView = ({ backup }: { backup?: BackupInfo }) => {
   } else {
     const doDeleteSnapshot = async () => {
       try {
-        await backrestService.forget(new ForgetRequest({
-          planId: backup.planId!,
-          repoId: backup.repoId!,
-          snapshotId: backup.snapshotId!
-        }));
+        await backrestService.forget(
+          new ForgetRequest({
+            planId: backup.planId!,
+            repoId: backup.repoId!,
+            snapshotId: backup.snapshotId!,
+          })
+        );
         alertApi!.success("Snapshot forgotten.");
       } catch (e) {
         alertApi!.error("Failed to forget snapshot: " + e);
       }
-    }
+    };
 
-    const deleteButton = backup.snapshotId ?
+    const deleteButton = backup.snapshotId ? (
       <Tooltip title="This will remove the snapshot from the repository. This is irreversible.">
         <ConfirmButton
           type="text"
           confirmTitle="Confirm forget?"
           confirmTimeout={2000}
           onClickAsync={doDeleteSnapshot}
-        >Forget (Destructive)</ConfirmButton>
-      </Tooltip> : <ConfirmButton
+        >
+          Forget (Destructive)
+        </ConfirmButton>
+      </Tooltip>
+    ) : (
+      <ConfirmButton
         type="text"
         confirmTitle="Confirm clear?"
         onClickAsync={async () => {
-          backrestService.clearHistory(new ClearHistoryRequest({
-            ops: backup.operations.map((op) => op.id),
-          }))
+          backrestService.clearHistory(
+            new ClearHistoryRequest({
+              selector: new OpSelector({
+                ids: backup.operations.map((op) => op.id),
+              }),
+            })
+          );
         }}
       >
         Delete Event
-      </ConfirmButton>;
+      </ConfirmButton>
+    );
 
-    return <div style={{ width: "100%" }}>
-      <div style={{
-        alignItems: "center",
-        display: "flex",
-        flexDirection: "row",
-        width: "100%",
-        height: "60px",
-      }}>
-        <h3>Backup on {formatTime(backup.displayTime)}</h3>
-        <div style={{ position: "absolute", right: "20px" }}>
-          {backup.status !== OperationStatus.STATUS_PENDING && backup.status != OperationStatus.STATUS_INPROGRESS ? deleteButton : null}
+    return (
+      <div style={{ width: "100%" }}>
+        <div
+          style={{
+            alignItems: "center",
+            display: "flex",
+            flexDirection: "row",
+            width: "100%",
+            height: "60px",
+          }}
+        >
+          <h3>Backup on {formatTime(backup.displayTime)}</h3>
+          <div style={{ position: "absolute", right: "20px" }}>
+            {backup.status !== OperationStatus.STATUS_PENDING &&
+            backup.status != OperationStatus.STATUS_INPROGRESS
+              ? deleteButton
+              : null}
+          </div>
         </div>
+        <OperationList key={backup.id} useBackups={[backup]} />
       </div>
-      <OperationList key={backup.id} useBackups={[backup]} />
-    </div>;
+    );
   }
-}
+};
