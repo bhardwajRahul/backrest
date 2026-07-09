@@ -1,4 +1,5 @@
 import * as fs from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
 import * as path from 'node:path';
 import { create } from '@bufbuild/protobuf';
 import { test, expect } from '../harness/fixtures';
@@ -59,11 +60,32 @@ async function runBackupViaApi(
   throw new Error(`backup for plan ${planId} did not succeed within ${timeoutMs}ms`);
 }
 
+/**
+ * True if an `rclone` executable is resolvable on PATH. restic's rclone backend
+ * shells out to it, so without it this whole spec cannot exercise anything; we
+ * skip rather than fail on hosts that don't provide it (CI installs it; the nix
+ * dev shell provides it).
+ */
+async function rcloneAvailable(): Promise<boolean> {
+  const dirs = (process.env.PATH ?? '').split(path.delimiter).filter(Boolean);
+  for (const dir of dirs) {
+    try {
+      await fs.access(path.join(dir, 'rclone'), fsConstants.X_OK);
+      return true;
+    } catch {
+      // keep looking
+    }
+  }
+  return false;
+}
+
 test.describe('rclone-backed repo', () => {
   test('adds an rclone repo through the UI, backs up, and is usable end-to-end', async ({
     page,
     backrest,
   }) => {
+    test.skip(!(await rcloneAvailable()), 'rclone not found on PATH');
+
     // rclone init + test + backup each spawn a `rclone serve restic` process;
     // give the whole flow a generous budget on a possibly-loaded machine.
     test.setTimeout(420_000);
